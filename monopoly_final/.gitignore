@@ -1,0 +1,10 @@
+# CrowPanel official example repo (large, cloned locally for reference)
+CrowPanel-Advance-5-HMI-ESP32-S3-AI-Powered-IPS-Touch-Screen-800x480/
+CrowPanel-Advance-5-HMI-ESP32-S3-AI-Powered-IPS-Touch-Screen-800x480-master.zip
+
+# Datasheets and PDFs (large binary files)
+*.pdf
+pdf_pages/
+
+# PlatformIO build artifacts
+.pio/
