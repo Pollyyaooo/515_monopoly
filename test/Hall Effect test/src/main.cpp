@@ -10,11 +10,11 @@ void printSensorStatus(int pin, String name) {
   Serial.print("V  →  ");
 
   if (voltage > 2.5) {
-    Serial.println("A come！");
+    Serial.println("玩家A 到达！");
   } else if (voltage < 0.8) {
-    Serial.println("B come！");
+    Serial.println("玩家B 到达！");
   } else {
-    Serial.println("empty");
+    Serial.println("空格");
   }
 }
 
