@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-WMIObject Win32_SerialPort | Select-Object DeviceID, Description\")",
+      "Bash(powershell -Command \"[System.IO.Ports.SerialPort]::getportnames\\(\\)\")"
+    ]
+  }
+}

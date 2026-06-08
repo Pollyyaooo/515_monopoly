@@ -11,19 +11,42 @@
 // [1] INCLUDES
 // ─────────────────────────────────────────────────────────────
 #include <Arduino.h>        // required by PlatformIO (not needed in .ino)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// XIAO ESP32S3 user LED is on GPIO21
+#define STATUS_LED 21
+#define LED_BLINK(n, ms) for(int _i=0;_i<(n);_i++){digitalWrite(STATUS_LED,HIGH);delay(ms);digitalWrite(STATUS_LED,LOW);delay(ms);}
+
+static inline bool validPin(int pin) {
+  return pin >= 0 && pin < 49;
+}
+
+static void blinkStatus(int count, int ms) {
+  if (!validPin(STATUS_LED)) return;
+  for (int i = 0; i < count; i++) {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(ms);
+    digitalWrite(STATUS_LED, LOW);
+    delay(ms);
+  }
+}
+
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
 #include <Adafruit_PN532.h>
+#include <NimBLEDevice.h>
 
 // ─────────────────────────────────────────────────────────────
 // [2] PIN DEFINES — OLED SPI
 // XIAO ESP32S3: D10=GPIO9 (MOSI), D8=GPIO7 (SCK)
 // RST is tied to 3.3V on the module (hardware reset), no GPIO needed
 // ─────────────────────────────────────────────────────────────
-#define OLED_CS   D1   // GPIO1
-#define OLED_DC   D2   // GPIO2
+#define OLED_CS   D1   // GPIO2
+#define OLED_DC   D2   // GPIO3
+#define OLED_RST  -1   // RST tied to 3.3V on the OLED module
 // MOSI and SCK are handled by hardware SPI (D10, D8)
 
 // ─────────────────────────────────────────────────────────────
@@ -33,11 +56,16 @@
 // ─────────────────────────────────────────────────────────────
 // Wire uses hardware I2C pins automatically on XIAO ESP32S3
 
+// Adafruit_PN532's I2C mode requires IRQ/RST GPIOs.
+// Connect PN532 IRQ -> D0 and RST -> D3 for this full player-device test.
+#define NFC_IRQ   D0   // GPIO1
+#define NFC_RST   D3   // GPIO4
+
 // ─────────────────────────────────────────────────────────────
 // [4] PIN DEFINES — 5 BUTTONS (active LOW, internal pull-up)
 // ─────────────────────────────────────────────────────────────
-#define BTN_UP    D0   // GPIO0
-#define BTN_DOWN  D3   // GPIO3  (freed after RST→3.3V)
+#define BTN_UP    D6   // GPIO43
+#define BTN_DOWN  D7   // GPIO44
 #define BTN_LEFT  D6   // GPIO43
 #define BTN_RIGHT D7   // GPIO44
 #define BTN_OK    D9   // GPIO8  (MISO pin, OLED is write-only)
@@ -45,8 +73,8 @@
 // ─────────────────────────────────────────────────────────────
 // [5] DISPLAY & NFC OBJECT INIT
 // ─────────────────────────────────────────────────────────────
-Adafruit_SSD1351 display(128, 128, &SPI, OLED_CS, OLED_DC, /*RST=*/-1);
-Adafruit_PN532   nfc(/*IRQ=*/-1, /*RESET=*/-1);  // I2C mode, no IRQ/RST pins needed
+Adafruit_SSD1351 display(128, 128, &SPI, OLED_CS, OLED_DC, OLED_RST);
+Adafruit_PN532   nfc(/*IRQ=*/NFC_IRQ, /*RESET=*/NFC_RST);
 
 // ─────────────────────────────────────────────────────────────
 // [6] COLOR CONSTANTS (RGB565)
@@ -216,6 +244,107 @@ bool needRedraw   = true;
 int  propScrollOffset = 0;   // for PROPERTIES page scrolling
 
 // ─────────────────────────────────────────────────────────────
+// [BLE] NimBLE Client — connects to MonopolyCentral
+// ─────────────────────────────────────────────────────────────
+#define BLE_SERVER_NAME  "MonopolyCentral"
+#define BLE_SVC_UUID     "0000AA01-0000-1000-8000-00805F9B34FB"
+#define BLE_CHR_NOTIFY   "0000BB01-0000-1000-8000-00805F9B34FB"
+#define BLE_CHR_WRITE    "0000BB02-0000-1000-8000-00805F9B34FB"
+
+static NimBLEAdvertisedDevice*     pFoundServer = nullptr;
+static NimBLEClient*               pBLEClient   = nullptr;
+static NimBLERemoteCharacteristic* pWriteRC     = nullptr;
+static bool                        bleConnected = false;
+static char                        bleRxBuf[32] = "";
+static volatile bool               bleRxDirty   = false;
+
+// Called from BLE notify task — only set flags, never draw directly
+void onBLENotify(NimBLERemoteCharacteristic* rc, uint8_t* data, size_t len, bool isNotify) {
+  snprintf(bleRxBuf, sizeof(bleRxBuf), "%.*s", (int)min(len, (size_t)31), (char*)data);
+  bleRxDirty = true;
+  needRedraw  = true;
+  Serial.printf("[BLE] RX: %s\n", bleRxBuf);
+}
+
+class BLEClientCB : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient* c) override {
+    bleConnected = false;
+    pBLEClient   = nullptr;
+    pWriteRC     = nullptr;
+    needRedraw   = true;
+    Serial.println("[BLE] Disconnected — restarting scan");
+    NimBLEDevice::getScan()->start(10, nullptr, false);
+  }
+};
+
+class BLEScanCB : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* device) override {
+    if (device->getName() == BLE_SERVER_NAME) {
+      pFoundServer = device;
+      NimBLEDevice::getScan()->stop();
+      Serial.println("[BLE] Found MonopolyCentral — stopping scan");
+    }
+  }
+};
+
+// Blocking connect (called from loop when pFoundServer != nullptr)
+bool bleDoConnect() {
+  Serial.println("[BLE] Connecting...");
+  NimBLEClient* c = NimBLEDevice::createClient();
+  c->setClientCallbacks(new BLEClientCB(), false);
+
+  if (!c->connect(pFoundServer)) {
+    Serial.println("[BLE] Connect failed");
+    NimBLEDevice::deleteClient(c);
+    return false;
+  }
+  NimBLERemoteService* svc = c->getService(BLE_SVC_UUID);
+  if (!svc) { c->disconnect(); NimBLEDevice::deleteClient(c); return false; }
+
+  NimBLERemoteCharacteristic* notifyRC = svc->getCharacteristic(BLE_CHR_NOTIFY);
+  if (notifyRC && notifyRC->canNotify()) {
+    notifyRC->subscribe(true, onBLENotify);
+  }
+  pWriteRC    = svc->getCharacteristic(BLE_CHR_WRITE);
+  pBLEClient  = c;
+  pFoundServer = nullptr;
+  bleConnected = true;
+  needRedraw   = true;
+  Serial.println("[BLE] Connected to MonopolyCentral!");
+
+  // Register as Player 1
+  if (pWriteRC) pWriteRC->writeValue("P1:HELLO", false);
+  return true;
+}
+
+#define BLE_STATUS(msg) do { \
+  display.fillRect(0, 80, 128, 10, C_BLACK); \
+  display.setTextColor(C_CYAN); display.setCursor(4, 80); display.print(msg); \
+} while(0)
+
+void setupBLE() {
+  BLE_STATUS("BLE 1:init");
+  delay(100);
+  NimBLEDevice::init("MonopolyPlayer");
+  BLE_STATUS("BLE 2:power");
+  delay(100);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  BLE_STATUS("BLE 3:scan");
+  delay(100);
+  NimBLEScan* pScan = NimBLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new BLEScanCB(), false);
+  pScan->setActiveScan(true);
+  pScan->setInterval(100);
+  pScan->setWindow(99);
+  BLE_STATUS("BLE 4:start");
+  delay(100);
+  // Use 10s timed scan instead of infinite (0) — avoids stack crash on ESP32S3
+  // onDisconnect() and loop() will restart scan as needed
+  pScan->start(10, nullptr, false);
+  BLE_STATUS("BLE 5:done");
+}
+
+// ─────────────────────────────────────────────────────────────
 // [11] NFC HANDLER
 // ─────────────────────────────────────────────────────────────
 
@@ -357,6 +486,14 @@ void handleButtonEvent(uint8_t pin, ButtonEvent evt) {
       if (pin == BTN_RIGHT && evt == EVT_SHORT) { currentPage = PAGE_ACTION;     needRedraw = true; }
       if (pin == BTN_UP    && evt == EVT_SHORT) { currentPage = PAGE_PROPERTIES; needRedraw = true; propScrollOffset = 0; }
       if (pin == BTN_DOWN  && evt == EVT_SHORT) { currentPage = PAGE_CARDS;      needRedraw = true; }
+      if (pin == BTN_LEFT  && evt == EVT_SHORT) {
+        if (bleConnected && pWriteRC) {
+          pWriteRC->writeValue("P1:PING", false);
+          Serial.println("[BLE] TX: P1:PING");
+        } else {
+          Serial.println("[BLE] Not connected — cannot send");
+        }
+      }
       break;
 
     case PAGE_ACTION:
@@ -497,12 +634,30 @@ void drawHome() {
     display.print("'s turn...");
   }
 
+  // BLE status
+  display.setCursor(4, 82);
+  if (bleConnected) {
+    display.setTextColor(C_GREEN);
+    display.print("BLE: Connected");
+    if (bleRxBuf[0]) {
+      display.setCursor(4, 94);
+      display.setTextColor(C_CYAN);
+      char tmp[18];
+      strncpy(tmp, bleRxBuf, 17);
+      tmp[17] = '\0';
+      display.print(tmp);
+    }
+  } else {
+    display.setTextColor(C_GRAY);
+    display.print("BLE: Scanning...");
+  }
+
   // Navigation hints
   display.setTextColor(C_GRAY);
   display.setCursor(4, 108);
-  display.print("OK:ScanNFC R:Action");
+  display.print("OK:NFC R:Action");
   display.setCursor(4, 118);
-  display.print("U:Prop D:Cards");
+  display.print("L:BLEping U:Prop D:Card");
 }
 
 // ── drawAction ────────────────────────────────────────────────
@@ -702,52 +857,116 @@ void redrawScreen() {
 // [15] SETUP
 // ─────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("[BOOT] player_device_test starting...");
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
 
-  // OLED
+  // Stage 0: code starts (5 blinks)
+  if (validPin(STATUS_LED)) pinMode(STATUS_LED, OUTPUT);
+  blinkStatus(5, 150);
+  delay(500);
+
+  Serial.begin(115200);
+  // Wait up to 3s for USB CDC to connect
+  uint32_t t0 = millis();
+  while (!Serial && (millis() - t0 < 3000)) delay(10);
+  delay(200);
+  Serial.println("[BOOT] Serial ready");
+  // Stage 1: after Serial.begin (1 long blink)
+  blinkStatus(1, 600);
+  delay(500);
+
+  // OLED — explicitly init SPI pins before display.begin()
+  // XIAO ESP32S3: SCK=D8(GPIO7), MISO=D9(GPIO8), MOSI=D10(GPIO9), CS=D1(OLED_CS)
+  SPI.begin(D8, D9, D10, OLED_CS);
   display.begin();
   display.setRotation(0);
-  display.fillScreen(C_BLACK);
   display.setTextWrap(false);
-  Serial.println("[OLED] OK");
+  // Draw something immediately — if this appears, OLED is alive
+  display.fillScreen(C_BLACK);
+  display.setTextColor(C_GREEN);
+  display.setTextSize(1);
+  display.setCursor(4, 10);
+  display.print("OLED OK");
+  display.setCursor(4, 24);
+  display.print("Init...");
+  // Stage 2: after display.begin (2 blinks)
+  blinkStatus(2, 150);
+  delay(500);
 
   // PN532 (I2C)
-  Wire.begin();
+  display.setCursor(4, 38);
+  display.setTextColor(C_YELLOW);
+  display.print("NFC init...");
+  Wire.begin(D4, D5);
   nfc.begin();
+  display.setCursor(4, 52);
+  display.print("NFC getFW...");
   uint32_t versiondata = nfc.getFirmwareVersion();
+  // Stage 3: after NFC init (3 blinks)
+  blinkStatus(3, 150);
+  delay(500);
+
   if (!versiondata) {
-    Serial.println("[NFC] PN532 not found! Check wiring & I2C mode switch.");
-    display.fillScreen(C_BLACK);
+    display.setCursor(4, 66);
     display.setTextColor(C_RED);
-    display.setCursor(4, 20);
-    display.print("PN532 not found!");
-    display.setCursor(4, 34);
-    display.print("Check I2C wiring");
-    // Don't halt — continue without NFC for UI testing
+    display.print("PN532 FAIL - skip");
+    delay(1000);
+    // Continue anyway — NFC not critical for basic display test
   } else {
     nfc.SAMConfig();
-    Serial.printf("[NFC] PN532 firmware v%d.%d\n",
-                  (versiondata >> 16) & 0xFF,
-                  (versiondata >>  8) & 0xFF);
+    display.setCursor(4, 66);
+    display.setTextColor(C_GREEN);
+    display.print("NFC OK");
   }
 
   // Buttons
   initButtons();
-  Serial.println("[BTN] 5 buttons initialized");
 
   // Mock game data
   initMockData();
-  Serial.println("[GAME] Mock data loaded");
 
+  // BLE Client
+  display.setCursor(4, 80);
+  display.setTextColor(C_CYAN);
+  display.print("BLE init...");
+  setupBLE();
+  display.setCursor(4, 94);
+  display.setTextColor(C_GREEN);
+  display.print("BLE scanning...");
+
+  // Stage 4: setup complete (4 rapid blinks)
+  LED_BLINK(4, 80);
+
+  // Draw initial screen immediately (don't wait for loop)
   needRedraw = true;
+  redrawScreen();
 }
 
 // ─────────────────────────────────────────────────────────────
 // [16] LOOP
 // ─────────────────────────────────────────────────────────────
 void loop() {
+  // BLE: restart scan when not connected and scan has stopped
+  if (!bleConnected && !pFoundServer && !NimBLEDevice::getScan()->isScanning()) {
+    NimBLEDevice::getScan()->start(10, nullptr, false);
+  }
+
+  // BLE: connect when server is found (blocking ~500ms, safe between frames)
+  if (pFoundServer && !bleConnected) {
+    // Show connecting status before blocking connect
+    display.fillScreen(C_BLACK);
+    display.setTextColor(C_CYAN);
+    display.setTextSize(1);
+    display.setCursor(4, 50);
+    display.print("BLE Connecting...");
+    bleDoConnect();
+  }
+
+  // BLE: handle incoming notification (flag set in BLE task)
+  if (bleRxDirty) {
+    bleRxDirty = false;
+    needRedraw  = true;
+  }
+
   // NFC has priority — any page can be interrupted by a card scan
   scanNFC();
 
